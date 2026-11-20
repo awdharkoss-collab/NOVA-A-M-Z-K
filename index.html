@@ -388,7 +388,7 @@ Bana ruh halini, müzik türünü veya dinlemek istediğin ortamı anlat.
 <audio id="audio"></audio>
 
 <script>
-/* NOVA MUSIC - Jamendo public read API */
+/* NOVA MUSIC - Jamendo + Openverse public catalogs */
 const JAMENDO_CLIENT_ID = "efad991c";
 const JAMENDO_API = "https://api.jamendo.com/v3.0/tracks/";
 const JAMENDO_ARTISTS_API = "https://api.jamendo.com/v3.0/artists/";
@@ -479,7 +479,7 @@ function refresh() {
   if (empty) empty.style.display = favorites.length ? "none" : "block";
 }
 async function fetchJamendoTracks(query = "") {
-  const params = new URLSearchParams({
+  const base = {
     client_id: JAMENDO_CLIENT_ID,
     format: "json",
     limit: "50",
@@ -487,17 +487,30 @@ async function fetchJamendoTracks(query = "") {
     audioformat: "mp32",
     imagesize: "300",
     include: "musicinfo,licenses"
-  });
-  if (query.trim()) params.set("search", query.trim());
-  else {
-    params.set("featured", "1");
-    params.set("boost", "popularity_month");
+  };
+  const requests = [];
+  if (!query.trim()) {
+    const params = new URLSearchParams({...base, featured:"1", boost:"popularity_month"});
+    requests.push(fetch(JAMENDO_API + "?" + params.toString()));
+  } else {
+    // Jamendo's general search covers track, album, artist and tags.
+    const general = new URLSearchParams({...base, search:query.trim()});
+    requests.push(fetch(JAMENDO_API + "?" + general.toString()));
+    // Exact artist-name filter helps when the user types an artist rather than a song.
+    const byArtist = new URLSearchParams({...base, artist_name:query.trim()});
+    requests.push(fetch(JAMENDO_API + "?" + byArtist.toString()));
+    // Track-title matching is separate from general search.
+    const byTitle = new URLSearchParams({...base, namesearch:query.trim()});
+    requests.push(fetch(JAMENDO_API + "?" + byTitle.toString()));
   }
-  const response = await fetch(JAMENDO_API + "?" + params.toString());
-  if (!response.ok) throw new Error("Jamendo API: " + response.status);
-  const data = await response.json();
-  if (data?.headers?.status === "failed") throw new Error(data.headers.error_message || "Jamendo isteği başarısız");
-  return (data.results || []).map(normalizeTrack).filter(t => t.file);
+  const responses = await Promise.allSettled(requests);
+  const all = [];
+  for (const result of responses) {
+    if (result.status !== "fulfilled" || !result.value.ok) continue;
+    const data = await result.value.json();
+    if (data?.headers?.status !== "failed") all.push(...(data.results || []));
+  }
+  return all.map(normalizeTrack).filter(t => t.file);
 }
 async function fetchJamendoArtistTracks(query) {
   if (!query.trim()) return [];
@@ -517,7 +530,7 @@ async function fetchJamendoArtistTracks(query) {
       client_id: JAMENDO_CLIENT_ID,
       format: "json",
       limit: "20",
-      type: "single albumtrack",
+      track_type: "single albumtrack",
       audioformat: "mp32",
       imagesize: "300",
       include: "musicinfo,licenses",
@@ -549,7 +562,7 @@ async function fetchOpenverseTracks(query = "") {
 }
 async function loadJamendoTracks(query = "") {
   currentQuery = query;
-  setStatus(query ? "Jamendo ve açık lisanslı kaynaklarda aranıyor…" : "Jamendo kataloğu yükleniyor…");
+  setStatus(query ? "Jamendo'da parça + sanatçı adı, Openverse'de açık lisanslı kayıt aranıyor…" : "Jamendo kataloğu yükleniyor…");
   const results = await Promise.allSettled([
     fetchJamendoTracks(query),
     query ? fetchJamendoArtistTracks(query) : Promise.resolve([]),
@@ -694,26 +707,59 @@ function stopFrequency() {
   });
 }
 
-/* Doğa sesleri: bu sesler için ayrıca lisanslı ses dosyaları gerekir. */
+/* Doğa sesleri: Openverse'in açık lisanslı ses efektleri kataloğundan yüklenir. */
 const nature = [
-  ["🌧","Yağmur","sounds/rain.mp3"],["🌲","Orman","sounds/forest.mp3"],
-  ["🌊","Okyanus","sounds/ocean.mp3"],["🔥","Şömine","sounds/fire.mp3"],
-  ["🌙","Gece","sounds/night.mp3"],["🍃","Rüzgâr","sounds/wind.mp3"]
+  ["🌧","Yağmur","rain sound"],
+  ["🌲","Orman","forest ambience birds"],
+  ["🌊","Okyanus","ocean waves"],
+  ["🔥","Şömine","fireplace crackling"],
+  ["🌙","Gece","night crickets ambience"],
+  ["🍃","Rüzgâr","wind in trees"]
 ];
+async function fetchNatureSound(query) {
+  const params = new URLSearchParams({q:query, page_size:"20", category:"sound_effect"});
+  const response = await fetch(OPENVERSE_AUDIO_API + "?" + params.toString(), {
+    headers: {"Accept":"application/json"}
+  });
+  if (!response.ok) throw new Error("Openverse sound API: " + response.status);
+  const data = await response.json();
+  const results = (data.results || []).filter(t =>
+    t.url && t.license && !t.removed_from_source &&
+    !t.mature && !t.unstable__sensitivity
+  );
+  return results;
+}
 nature.forEach(item => {
   const div=document.createElement("div"); div.className="nature";
-  div.innerHTML=`${item[0]}<h3>${item[1]}</h3><button>▶ Dinle</button>`;
-  div.querySelector("button").onclick=()=>{
-    stopFrequency(); audio.src=item[2];
-    audio.play().catch(()=>alert("Bu doğa sesi henüz sunucuya eklenmemiş."));
-    document.getElementById("currentTitle").textContent=item[1];
-    document.getElementById("currentArtist").textContent="NOVA NATURE";
-    document.getElementById("currentImage").src="https://images.unsplash.com/photo-1470770841072-f978cf4d019e?w=200";
+  div.innerHTML=`${item[0]}<h3>${item[1]}</h3><button>▶ Dinle</button><p class="muted nature-credit" style="font-size:10px;margin-top:8px">Açık lisanslı ses aranacak</p>`;
+  div.querySelector("button").onclick=async()=>{
+    const button=div.querySelector("button");
+    if (!audio.paused && document.getElementById("currentTitle").textContent===item[1]) {
+      audio.pause(); button.textContent="▶ Dinle"; return;
+    }
+    button.disabled=true; button.textContent="Yükleniyor…";
+    try {
+      const results=await fetchNatureSound(item[2]);
+      if (!results.length) throw new Error("Bu aramada uygun ses bulunamadı.");
+      const sound=results[0];
+      stopFrequency(); audio.pause(); audio.src=sound.url;
+      await audio.play();
+      document.getElementById("currentTitle").textContent=item[1];
+      document.getElementById("currentArtist").textContent=(sound.creator || "Bilinmeyen üretici")+" · Openverse";
+      document.getElementById("currentImage").src=sound.thumbnail || "https://images.unsplash.com/photo-1470770841072-f978cf4d019e?w=200";
+      div.querySelector(".nature-credit").innerHTML=`${escapeHTML(sound.creator || "Üretici belirtilmemiş")} · ${escapeHTML(sound.license)} · <a href="${escapeHTML(sound.foreign_landing_url || sound.detail_url || "https://openverse.org/")}" target="_blank" rel="noopener noreferrer">Kaynak</a> · <a href="${escapeHTML(sound.license_url || "https://creativecommons.org/licenses/")}" target="_blank" rel="noopener noreferrer">Lisans</a>`;
+      button.textContent="Ⅱ Durdur";
+      setStatus("Doğa sesi Openverse üzerinden oynatılıyor. Kaynak ve lisans kartta gösteriliyor.");
+    } catch(err) {
+      console.warn("Nature sound unavailable:",err);
+      alert("Bu aramada çalınabilir doğa sesi bulunamadı. Başka bir ses daha sonra denenebilir.");
+      button.textContent="▶ Dinle";
+    } finally { button.disabled=false; }
   };
   document.getElementById("natureGrid").appendChild(div);
 });
 
-/* NOVA AI: kullanıcı isteğine göre Jamendo kataloğunda arama yapar. */
+/* NOVA AI: kullanıcı isteğine göre Jamendo ve Openverse kataloglarında arama yapar. */
 function suggestAI(text) {
   document.getElementById("aiPrompt").value=text;
   askNovaAI();
