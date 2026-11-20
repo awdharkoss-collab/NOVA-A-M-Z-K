@@ -289,7 +289,7 @@ align-items:center;padding:0 25px;gap:20px;z-index:15
 </section>
 
 <section id="discover" class="page">
-<div class="section"><span class="eyebrow">MÜZİK EVRENİ</span><h2>✦ Müzikleri Keşfet</h2><p class="muted" style="margin:10px 0 18px">Jamendo kataloğundan çevrimiçi müzikler · Her parça kendi sanatçısına aittir.</p><div class="cards" id="discoverCards"></div><p class="muted" id="apiStatus" style="margin-top:18px">Müzik kataloğu yükleniyor…</p></div>
+<div class="section"><span class="eyebrow">MÜZİK EVRENİ</span><h2>✦ Müzikleri Keşfet</h2><p class="muted" style="margin:10px 0 18px">Jamendo ve Openverse açık lisanslı müzik kataloğu · Her parçada kaynak ve lisans bilgisi gösterilir.</p><div class="cards" id="discoverCards"></div><p class="muted" id="apiStatus" style="margin-top:18px">Müzik kataloğu yükleniyor…</p></div>
 </section>
 
 <section id="library" class="page">
@@ -391,6 +391,8 @@ Bana ruh halini, müzik türünü veya dinlemek istediğin ortamı anlat.
 /* NOVA MUSIC - Jamendo public read API */
 const JAMENDO_CLIENT_ID = "efad991c";
 const JAMENDO_API = "https://api.jamendo.com/v3.0/tracks/";
+const JAMENDO_ARTISTS_API = "https://api.jamendo.com/v3.0/artists/";
+const OPENVERSE_AUDIO_API = "https://api.openverse.org/v1/audio/";
 const audio = document.getElementById("audio");
 
 let music = [];
@@ -416,14 +418,35 @@ function setStatus(message) {
 }
 function normalizeTrack(t) {
   return {
-    id: String(t.id),
+    id: "jamendo-" + String(t.id),
     title: t.name || "Bilinmeyen parça",
     artist: t.artist_name || "Bilinmeyen sanatçı",
     genre: (t.musicinfo && t.musicinfo.tags && t.musicinfo.tags.genres || []).slice(0,2).join(", ") || "Jamendo",
     image: t.album_image || t.image || "https://images.unsplash.com/photo-1519608487953-e999c86e7455?w=400",
     file: t.audio || "",
     url: t.shareurl || t.shorturl || "https://www.jamendo.com/",
-    license: t.license_ccurl || ""
+    license: t.license_ccurl || "Jamendo kullanım koşulları",
+    source: "Jamendo",
+    attribution: `${t.name || "Parça"} — ${t.artist_name || "Sanatçı"} · Jamendo`,
+    artistUrl: t.artist_id ? `https://www.jamendo.com/artist/${t.artist_id}` : ""
+  };
+}
+function normalizeOpenverseTrack(t) {
+  const title = t.title || "İsimsiz ses kaydı";
+  const creator = t.creator || "Bilinmeyen sanatçı";
+  return {
+    id: "openverse-" + String(t.id),
+    title,
+    artist: creator,
+    genre: (t.genres || []).slice(0,2).join(", ") || "Açık lisanslı ses",
+    image: t.thumbnail || "https://images.unsplash.com/photo-1519608487953-e999c86e7455?w=400",
+    file: t.url || "",
+    url: t.foreign_landing_url || t.detail_url || "https://openverse.org/",
+    license: [t.license, t.license_version].filter(Boolean).join(" "),
+    licenseUrl: t.license_url || "",
+    source: "Openverse · " + (t.provider || "Açık kaynak"),
+    attribution: t.attribution || `${title} — ${creator} · ${t.license || "Açık lisans"}`,
+    artistUrl: t.creator_url || ""
   };
 }
 function renderMusic(list, target) {
@@ -440,7 +463,10 @@ function renderMusic(list, target) {
         <button onclick="playTrackById('${escapeHTML(track.id)}')">▶ Dinle</button>
         <button class="secondary" onclick="toggleFavoriteById('${escapeHTML(track.id)}')">${isFav?"♥":"♡"}</button>
       </div>
-      <p style="margin-top:9px"><a href="${escapeHTML(track.url)}" target="_blank" rel="noopener noreferrer" style="color:#b49cff;font-size:10px">Jamendo'da aç ↗</a></p>
+      <p style="margin-top:8px;color:#aaa;font-size:10px">${escapeHTML(track.source || "Müzik kaynağı")}</p>
+      <p style="margin-top:4px;color:#aaa;font-size:10px">${track.license && !track.license.startsWith("http") ? "Lisans: " + escapeHTML(track.license) : "Lisans bilgisi için kaynak sayfasını aç"}</p>
+      <p style="margin-top:4px"><a href="${escapeHTML(track.url)}" target="_blank" rel="noopener noreferrer" style="color:#b49cff;font-size:10px">Kaynakta aç ↗</a>
+      ${track.licenseUrl ? ` · <a href="${escapeHTML(track.licenseUrl)}" target="_blank" rel="noopener noreferrer" style="color:#b49cff;font-size:10px">Lisans</a>` : (track.license && track.license.startsWith("http") ? ` · <a href="${escapeHTML(track.license)}" target="_blank" rel="noopener noreferrer" style="color:#b49cff;font-size:10px">Lisans</a>` : "")}</p>
     </article>`;
   }).join("") || '<p class="muted">Bu aramada müzik bulunamadı.</p>';
 }
@@ -452,42 +478,102 @@ function refresh() {
   const empty = document.getElementById("libraryEmpty");
   if (empty) empty.style.display = favorites.length ? "none" : "block";
 }
-async function loadJamendoTracks(query = "") {
-  currentQuery = query;
-  setStatus("Jamendo kataloğunda aranıyor…");
+async function fetchJamendoTracks(query = "") {
   const params = new URLSearchParams({
     client_id: JAMENDO_CLIENT_ID,
     format: "json",
-    limit: "30",
+    limit: "50",
     type: "single albumtrack",
     audioformat: "mp32",
     imagesize: "300",
-    include: "musicinfo"
+    include: "musicinfo,licenses"
   });
-  if (query.trim()) params.set("namesearch", query.trim());
+  if (query.trim()) params.set("search", query.trim());
   else {
     params.set("featured", "1");
     params.set("boost", "popularity_month");
   }
-  try {
-    const response = await fetch(JAMENDO_API + "?" + params.toString());
-    if (!response.ok) throw new Error("API yanıtı: " + response.status);
-    const data = await response.json();
-    if (!data || !data.results) throw new Error(data?.headers?.error_message || "Beklenmeyen API yanıtı");
-    music = data.results.map(normalizeTrack).filter(t => t.file);
-    refresh();
-    setStatus(music.length
-      ? `${music.length} parça bulundu. Müzikler Jamendo sanatçıları tarafından sağlanır.`
-      : "Bu aramada çalınabilir parça bulunamadı. Başka bir kelime dene.");
-  } catch (error) {
-    console.error("Jamendo API error:", error);
-    setStatus("Müzik kataloğuna şu an bağlanılamadı. İnternet bağlantını veya Jamendo Client ID ayarını kontrol et.");
-    const home = document.getElementById("homeCards");
-    const discover = document.getElementById("discoverCards");
-    const msg = '<p class="muted">Müzik kataloğu yüklenemedi. Biraz sonra tekrar dene.</p>';
-    if (home) home.innerHTML = msg;
-    if (discover) discover.innerHTML = msg;
+  const response = await fetch(JAMENDO_API + "?" + params.toString());
+  if (!response.ok) throw new Error("Jamendo API: " + response.status);
+  const data = await response.json();
+  if (data?.headers?.status === "failed") throw new Error(data.headers.error_message || "Jamendo isteği başarısız");
+  return (data.results || []).map(normalizeTrack).filter(t => t.file);
+}
+async function fetchJamendoArtistTracks(query) {
+  if (!query.trim()) return [];
+  const params = new URLSearchParams({
+    client_id: JAMENDO_CLIENT_ID,
+    format: "json",
+    limit: "10",
+    namesearch: query.trim()
+  });
+  const response = await fetch(JAMENDO_ARTISTS_API + "?" + params.toString());
+  if (!response.ok) throw new Error("Jamendo artist API: " + response.status);
+  const data = await response.json();
+  const artists = data.results || [];
+  if (!artists.length) return [];
+  const trackLists = await Promise.all(artists.slice(0,5).map(async artist => {
+    const trackParams = new URLSearchParams({
+      client_id: JAMENDO_CLIENT_ID,
+      format: "json",
+      limit: "20",
+      type: "single albumtrack",
+      audioformat: "mp32",
+      imagesize: "300",
+      include: "musicinfo,licenses",
+      id: String(artist.id)
+    });
+    const r = await fetch("https://api.jamendo.com/v3.0/artists/tracks/?" + trackParams.toString());
+    if (!r.ok) return [];
+    const j = await r.json();
+    return (j.results || []).flatMap(a => (a.tracks || []).map(t => ({
+      ...t,
+      artist_name: t.artist_name || a.name,
+      artist_id: t.artist_id || a.id,
+      image: t.image || a.image
+    })));
+  }));
+  return trackLists.flat().map(normalizeTrack).filter(t => t.file);
+}
+async function fetchOpenverseTracks(query = "") {
+  if (!query.trim()) return [];
+  const params = new URLSearchParams({ q: query.trim(), page_size: "30", category: "music" });
+  const response = await fetch(OPENVERSE_AUDIO_API + "?" + params.toString(), {
+    headers: { "Accept": "application/json" }
+  });
+  if (!response.ok) throw new Error("Openverse API: " + response.status);
+  const data = await response.json();
+  return (data.results || [])
+    .filter(t => t.url && t.license && !t.removed_from_source && !t.isSensitive)
+    .map(normalizeOpenverseTrack);
+}
+async function loadJamendoTracks(query = "") {
+  currentQuery = query;
+  setStatus(query ? "Jamendo ve açık lisanslı kaynaklarda aranıyor…" : "Jamendo kataloğu yükleniyor…");
+  const results = await Promise.allSettled([
+    fetchJamendoTracks(query),
+    query ? fetchJamendoArtistTracks(query) : Promise.resolve([]),
+    query ? fetchOpenverseTracks(query) : Promise.resolve([])
+  ]);
+  const jamendoTracks = results[0].status === "fulfilled" ? results[0].value : [];
+  const artistTracks = results[1].status === "fulfilled" ? results[1].value : [];
+  const openverseTracks = results[2].status === "fulfilled" ? results[2].value : [];
+  const combined = [...jamendoTracks, ...artistTracks, ...openverseTracks];
+  const unique = new Map();
+  combined.forEach(track => {
+    if (track.file && !unique.has(track.id)) unique.set(track.id, track);
+  });
+  music = [...unique.values()];
+  refresh();
+  if (music.length) {
+    const sources = [...new Set(music.map(t => t.source.split(" · ")[0]))].join(" + ");
+    setStatus(`${music.length} çalınabilir sonuç bulundu · Kaynaklar: ${sources}. Her parçanın lisans koşulunu kontrol et.`);
+  } else if (results.every(r => r.status === "rejected")) {
+    setStatus("Müzik kaynaklarına ulaşılamadı. İnternet bağlantını ve API erişimini kontrol et.");
+  } else {
+    setStatus("Bu aramada çalınabilir açık lisanslı parça bulunamadı. Sanatçı adını veya arama kelimelerini değiştir.");
   }
+  if (query) console.info("NOVA catalog sources:", results.map(r => r.status));
 }
 function showPage(id, button) {
   document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
@@ -642,7 +728,7 @@ async function askNovaAI() {
   const prompt=input.value.trim();
   if (!prompt) { alert("NOVA AI'ya bir şey yaz!"); return; }
   addMessage(prompt,"user"); input.value="";
-  addMessage("İsteğine uygun parçaları Jamendo kataloğunda arıyorum…","ai");
+  addMessage("İsteğine uygun parçaları Jamendo ve açık lisanslı kaynaklarda arıyorum…","ai");
   const terms = prompt.toLocaleLowerCase("tr-TR");
   let query = prompt;
   if (/sakin|rahat|huzur|uyku|ders|çalış|piyano/.test(terms)) query="relax piano";
