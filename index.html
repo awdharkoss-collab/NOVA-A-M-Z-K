@@ -80,7 +80,7 @@ const audio = document.getElementById("audio");
 let music = [];
 let currentIndex = -1;
 let currentTrackId = null;
-let favorites = JSON.parse(localStorage.getItem("novaFavorites") || "[]");
+let favorites = JSON.parse(localStorage.getItem("novaFavorites") || "[]").map(String);
 let shuffle = false, repeat = false;
 let oscillator = null, audioContext = null, currentFrequency = null;
 let searchTimer = null;
@@ -107,39 +107,74 @@ function normalizeTrack(t) {
     license: t.license_ccurl || "", album: t.album_name || ""
   };
 }
+function requestJamendo(params) {
+  return new Promise((resolve, reject) => {
+    const callbackName = "novaJamendoCallback_" + Date.now() + "_" + Math.floor(Math.random()*100000);
+    const script = document.createElement("script");
+    const url = new URL(JAMENDO_ENDPOINT);
+    Object.entries({...params, client_id:JAMENDO_CLIENT_ID, format:"json", callback:callbackName})
+      .forEach(([key,value]) => url.searchParams.set(key, value));
+    let finished = false;
+    const cleanup = () => {
+      if (script.parentNode) script.parentNode.removeChild(script);
+      try { delete window[callbackName]; } catch(e) { window[callbackName] = undefined; }
+    };
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true; cleanup();
+      reject(new Error("Jamendo API zaman aşımına uğradı."));
+    }, 15000);
+    window[callbackName] = data => {
+      if (finished) return;
+      finished = true; clearTimeout(timer); cleanup(); resolve(data);
+    };
+    script.onerror = () => {
+      if (finished) return;
+      finished = true; clearTimeout(timer); cleanup();
+      reject(new Error("Jamendo API'ye bağlanılamadı. Client ID veya internet bağlantısını kontrol et."));
+    };
+    script.src = url.toString();
+    document.head.appendChild(script);
+  });
+}
+
 async function loadJamendo(query = "", target = "discover") {
   const status = document.getElementById("searchStatus");
   if (status) status.textContent = query ? `“${query}” aranıyor...` : "Jamendo kataloğu yükleniyor...";
-  const url = new URL(JAMENDO_ENDPOINT);
   const params = {
-    client_id: JAMENDO_CLIENT_ID,
-    format: "json",
     limit: "30",
     imagesize: "300",
-    audioformat: "mp32",
+    audioformat: "mp31",
     type: "single albumtrack",
     include: "musicinfo",
     ...(query ? {search: query} : {order: "popularity_total"})
   };
-  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
   try {
-    const response = await fetch(url.toString());
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = await response.json();
-    if (data.headers?.status !== "success") throw new Error(data.headers?.error_message || "Jamendo API yanıtı başarısız.");
-    const results = (data.results || []).map(normalizeTrack).filter(t => t.id && t.file && t.image);
+    const data = await requestJamendo(params);
+    const apiStatus = String(data?.headers?.status || "").toLowerCase();
+    if (apiStatus && !["success","succeed"].includes(apiStatus)) {
+      throw new Error(data.headers.error_message || `Jamendo API hata kodu: ${data.headers.code}`);
+    }
+    if (!Array.isArray(data?.results)) {
+      throw new Error(data?.headers?.error_message || "API beklenen müzik listesini döndürmedi.");
+    }
+    const results = data.results.map(normalizeTrack).filter(t => t.id && t.file && t.image);
     results.forEach(t => trackStore.set(t.id,t));
     music = results;
     refresh();
-    if (status) status.textContent = `${music.length} parça bulundu · Jamendo kataloğu`;
+    if (status) status.textContent = music.length
+      ? `${music.length} parça bulundu · Jamendo kataloğu`
+      : "Bu aramada parça bulunamadı. Başka bir kelime dene.";
     if (target === "ai") renderMusic(music, "aiResults");
   } catch (error) {
     console.error("Jamendo API:", error);
-    if (status) status.textContent = "Müzikler yüklenemedi. İnternet bağlantını ve Client ID'ni kontrol et.";
+    const message = `Müzikler yüklenemedi: ${error.message}`;
+    if (status) status.textContent = message;
     if (!music.length) {
-      document.getElementById("homeCards").innerHTML = '<p class="empty">Jamendo kataloğuna bağlanılamadı. Sayfayı yenileyip tekrar dene.</p>';
-      document.getElementById("discoverCards").innerHTML = '<p class="empty">API bağlantısı kurulamadı.</p>';
+      document.getElementById("homeCards").innerHTML = `<p class="empty">${escapeHTML(message)}</p>`;
+      document.getElementById("discoverCards").innerHTML = `<p class="empty">${escapeHTML(message)}</p>`;
     }
+    if (target === "ai") addMessage(message, "ai");
   }
 }
 function renderMusic(list, target) {
@@ -175,7 +210,7 @@ function toggleFavorite(id) {
 function playTrackById(id) {
   const track = trackStore.get(String(id));
   if (!track) return;
-  stopFrequency();
+  stopSound();
   currentTrackId = track.id;
   currentIndex = music.findIndex(t => t.id === track.id);
   audio.src = track.file;
@@ -212,7 +247,11 @@ audio.addEventListener("timeupdate", () => {
   document.getElementById("total").textContent = formatTime(audio.duration);
 });
 document.getElementById("progress").addEventListener("input", e => { if (audio.duration) audio.currentTime = Number(e.target.value)/100*audio.duration; });
-document.getElementById("volume").addEventListener("input", e => audio.volume = Number(e.target.value)/100);
+document.getElementById("volume").addEventListener("input", e => {
+  const value = Number(e.target.value)/100;
+  audio.volume = value;
+  if (soundMaster) soundMaster.gain.setTargetAtTime(value * 0.22, soundContext.currentTime, 0.03);
+});
 audio.volume = .7;
 
 document.getElementById("search").addEventListener("input", e => {
@@ -222,46 +261,163 @@ document.getElementById("search").addEventListener("input", e => {
   searchTimer = setTimeout(() => loadJamendo(query), 450);
 });
 
+/* NOVA SOUND ENGINE: Frekanslar ve doğa sesleri harici MP3 gerektirmeden üretilir. */
+let soundContext = null;
+let soundMaster = null;
+let activeSoundNodes = [];
+let activeSoundTimers = [];
+let soundStopRequested = false;
+
+async function ensureSoundContext() {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) throw new Error("Tarayıcın Web Audio API desteklemiyor.");
+  if (!soundContext || soundContext.state === "closed") {
+    soundContext = new AudioCtx();
+    soundMaster = soundContext.createGain();
+    soundMaster.gain.value = Number(document.getElementById("volume").value)/100 * 0.22;
+    soundMaster.connect(soundContext.destination);
+  }
+  if (soundContext.state !== "running") await soundContext.resume();
+  return soundContext;
+}
+function keepNode(node) { activeSoundNodes.push(node); return node; }
+function stopSound() {
+  soundStopRequested = true;
+  activeSoundTimers.forEach(id => clearInterval(id));
+  activeSoundTimers = [];
+  activeSoundNodes.forEach(node => {
+    try { node.stop?.(); } catch(e) {}
+    try { node.disconnect?.(); } catch(e) {}
+  });
+  activeSoundNodes = [];
+  currentFrequency = null;
+  document.querySelectorAll(".frequency,.nature").forEach(el => {
+    el.classList.remove("active");
+    const button = el.querySelector("button");
+    if (button) button.textContent = el.classList.contains("frequency") ? "Dinle" : "▶ Dinle";
+  });
+}
+function makeNoiseBuffer(ctx, seconds = 3) {
+  const length = Math.floor(ctx.sampleRate * seconds);
+  const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i=0;i<length;i++) data[i] = Math.random()*2-1;
+  return buffer;
+}
+function connectNoise(ctx, filterType, frequency, gainValue) {
+  const source = keepNode(ctx.createBufferSource());
+  source.buffer = makeNoiseBuffer(ctx, 4);
+  source.loop = true;
+  const filter = keepNode(ctx.createBiquadFilter());
+  filter.type = filterType;
+  filter.frequency.value = frequency;
+  const gain = keepNode(ctx.createGain());
+  gain.gain.value = gainValue;
+  source.connect(filter); filter.connect(gain); gain.connect(soundMaster);
+  source.start();
+  return {source,filter,gain};
+}
+async function playFrequency(hz, element) {
+  stopSound(); audio.pause();
+  try {
+    const ctx = await ensureSoundContext();
+    const osc = keepNode(ctx.createOscillator());
+    const gain = keepNode(ctx.createGain());
+    osc.type = "sine"; osc.frequency.value = hz;
+    gain.gain.value = 0.16;
+    osc.connect(gain); gain.connect(soundMaster); osc.start();
+    currentFrequency = hz;
+    element.classList.add("active");
+    element.querySelector("button").textContent = "Durdur";
+    document.getElementById("currentTitle").textContent = hz + " Hz";
+    document.getElementById("currentArtist").textContent = "NOVA SOUND LAB";
+  } catch(e) { alert(e.message || "Ses başlatılamadı."); }
+}
 const frequencyGrid = document.getElementById("frequencyGrid");
 [174,285,396,432,528,639,741,852,963].forEach(hz => {
   const div = document.createElement("div");
   div.className = "frequency";
   div.innerHTML = `〰<strong>${hz} Hz</strong><span>Ses deneyimi</span><button type="button">Dinle</button>`;
-  div.querySelector("button").addEventListener("click", () => playFrequency(hz,div));
+  div.querySelector("button").addEventListener("click", async () => {
+    if (currentFrequency === hz) { stopSound(); return; }
+    await playFrequency(hz, div);
+  });
   frequencyGrid.appendChild(div);
 });
-async function playFrequency(hz, element) {
-  if (currentFrequency === hz) { stopFrequency(); return; }
-  stopFrequency(); audio.pause();
+
+/* Doğa atmosferleri: yağmur, rüzgâr, okyanus, şömine, orman ve gece. */
+async function playNature(kind, element, name) {
+  stopSound(); audio.pause();
   try {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    await audioContext.resume();
-    oscillator = audioContext.createOscillator();
-    const gain = audioContext.createGain();
-    oscillator.type = "sine"; oscillator.frequency.value = hz; gain.gain.value = .025;
-    oscillator.connect(gain); gain.connect(audioContext.destination); oscillator.start();
-    currentFrequency = hz;
-    document.querySelectorAll(".frequency").forEach(e=>{e.classList.remove("active");e.querySelector("button").textContent="Dinle";});
-    element.classList.add("active"); element.querySelector("button").textContent="Durdur";
-    document.getElementById("currentTitle").textContent = hz+" Hz";
-    document.getElementById("currentArtist").textContent = "NOVA SOUND LAB";
-  } catch(e) { console.error(e); alert("Ses başlatılamadı."); }
+    const ctx = await ensureSoundContext();
+    soundStopRequested = false;
+    if (kind === "rain") {
+      connectNoise(ctx, "highpass", 650, 0.42);
+      connectNoise(ctx, "lowpass", 3800, 0.12);
+    } else if (kind === "ocean") {
+      const n = connectNoise(ctx, "lowpass", 520, 0.30);
+      const lfo = keepNode(ctx.createOscillator()), depth = keepNode(ctx.createGain());
+      lfo.frequency.value = 0.12; depth.gain.value = 0.20;
+      lfo.connect(depth); depth.connect(n.gain.gain); lfo.start();
+    } else if (kind === "wind") {
+      const n = connectNoise(ctx, "lowpass", 330, 0.28);
+      const lfo = keepNode(ctx.createOscillator()), depth = keepNode(ctx.createGain());
+      lfo.frequency.value = 0.07; depth.gain.value = 0.17;
+      lfo.connect(depth); depth.connect(n.gain.gain); lfo.start();
+    } else if (kind === "fire") {
+      connectNoise(ctx, "lowpass", 900, 0.10);
+      const crackle = () => {
+        if (soundStopRequested || !soundContext) return;
+        const osc = ctx.createOscillator(), g = ctx.createGain();
+        osc.type = "triangle"; osc.frequency.value = 500 + Math.random()*1500;
+        g.gain.setValueAtTime(0.0001,ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.10,ctx.currentTime+0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+0.09);
+        osc.connect(g); g.connect(soundMaster); osc.start(); osc.stop(ctx.currentTime+0.1);
+      };
+      activeSoundTimers.push(setInterval(crackle, 180));
+    } else if (kind === "forest") {
+      connectNoise(ctx, "lowpass", 1200, 0.045);
+      const chirp = () => {
+        if (soundStopRequested || !soundContext) return;
+        const osc=ctx.createOscillator(), g=ctx.createGain();
+        osc.type="sine"; osc.frequency.setValueAtTime(1700+Math.random()*900,ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(2300+Math.random()*700,ctx.currentTime+0.08);
+        g.gain.setValueAtTime(0.0001,ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.055,ctx.currentTime+0.025);
+        g.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+0.16);
+        osc.connect(g); g.connect(soundMaster); osc.start(); osc.stop(ctx.currentTime+0.17);
+      };
+      activeSoundTimers.push(setInterval(chirp, 950));
+    } else if (kind === "night") {
+      connectNoise(ctx, "lowpass", 500, 0.025);
+      const cricket = () => {
+        if (soundStopRequested || !soundContext) return;
+        const osc=ctx.createOscillator(), g=ctx.createGain();
+        osc.type="sine"; osc.frequency.value=3600+Math.random()*500;
+        g.gain.setValueAtTime(0.0001,ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.035,ctx.currentTime+0.015);
+        g.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+0.11);
+        osc.connect(g); g.connect(soundMaster); osc.start(); osc.stop(ctx.currentTime+0.12);
+      };
+      activeSoundTimers.push(setInterval(cricket, 420));
+    }
+    element.classList.add("active");
+    element.querySelector("button").textContent = "Durdur";
+    document.getElementById("currentTitle").textContent = name;
+    document.getElementById("currentArtist").textContent = "NOVA NATURE · Üretilen atmosfer";
+  } catch(e) { alert(e.message || "Doğa sesi başlatılamadı."); }
 }
-function stopFrequency() {
-  if (oscillator) { try { oscillator.stop(); } catch(e) {} oscillator=null; }
-  if (audioContext) { audioContext.close().catch(()=>{}); audioContext=null; }
-  currentFrequency=null;
-  document.querySelectorAll(".frequency").forEach(e=>{e.classList.remove("active");e.querySelector("button").textContent="Dinle";});
-}
-const natureItems = [["🌧","Yağmur","sounds/rain.mp3"],["🌲","Orman","sounds/forest.mp3"],["🌊","Okyanus","sounds/ocean.mp3"],["🔥","Şömine","sounds/fire.mp3"],["🌙","Gece","sounds/night.mp3"],["🍃","Rüzgâr","sounds/wind.mp3"]];
-natureItems.forEach(([emoji,name,file]) => {
+const natureItems = [
+  ["🌧","Yağmur","rain"],["🌲","Orman","forest"],["🌊","Okyanus","ocean"],
+  ["🔥","Şömine","fire"],["🌙","Gece","night"],["🍃","Rüzgâr","wind"]
+];
+natureItems.forEach(([emoji,name,kind]) => {
   const div=document.createElement("div"); div.className="nature";
   div.innerHTML=`${emoji}<h3>${name}</h3><button type="button">▶ Dinle</button>`;
-  div.querySelector("button").addEventListener("click",()=>{
-    stopFrequency(); audio.src=file;
-    audio.play().catch(()=>alert(`"${file}" dosyası bulunamadı. Proje klasöründe sounds klasörü oluşturup ilgili MP3 dosyasını ekle.`));
-    document.getElementById("currentTitle").textContent=name;
-    document.getElementById("currentArtist").textContent="NOVA NATURE";
+  div.querySelector("button").addEventListener("click", () => {
+    if (div.classList.contains("active")) { stopSound(); return; }
+    playNature(kind,div,name);
   });
   document.getElementById("natureGrid").appendChild(div);
 });
